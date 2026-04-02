@@ -1,0 +1,67 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            binary: vsdx2pdf.exe
+            asset: vsdx2pdf_windows_amd64.zip
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            binary: vsdx2pdf
+            asset: vsdx2pdf_linux_amd64.zip
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            binary: vsdx2pdf
+            asset: vsdx2pdf_macos_amd64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+
+      - name: Build Binary
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "${{ matrix.goos }}"
+          $env:GOARCH = "${{ matrix.goarch }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          go build -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" -o "dist/${{ matrix.binary }}" ./cmd/vsdx2pdf
+
+      - name: Package Release Asset
+        shell: pwsh
+        run: |
+          $staging = Join-Path $PWD "dist/package"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "dist/${{ matrix.binary }}" $staging
+          Copy-Item README.md $staging
+          Copy-Item ABOUT.md $staging
+          Copy-Item USAGE.md $staging
+          if (Test-Path "dist/${{ matrix.asset }}") {
+            Remove-Item "dist/${{ matrix.asset }}" -Force
+          }
+          Compress-Archive -Path "$staging/*" -DestinationPath "dist/${{ matrix.asset }}"
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}

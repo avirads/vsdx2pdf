@@ -1,0 +1,6 @@
+dist/
+build/
+*.pdf
+*.zip
+*.tar.gz
+.DS_Store
