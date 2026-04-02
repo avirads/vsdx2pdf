@@ -1,4 +1,4 @@
-# vsdx2pdf
+# vsdx2pdf [libreoffice has feature to convert to pdf. use this app only if u cant use libreoffice. also this is basic.so dont expect much]
 
 `vsdx2pdf` is a standalone command-line converter for turning Visio `.vsdx` files into local PDF files without requiring Microsoft Visio, LibreOffice, cloud APIs, or any other runtime dependency.
 
