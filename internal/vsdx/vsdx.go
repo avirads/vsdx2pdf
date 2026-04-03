@@ -20,9 +20,10 @@ const (
 )
 
 type Document struct {
-	Pages    []*Page
-	masters  map[string]*Master
-	pageByID map[string]*Page
+	Pages       []*Page
+	DefaultFont string
+	masters     map[string]*Master
+	pageByID    map[string]*Page
 }
 
 type Page struct {
@@ -46,17 +47,18 @@ type Master struct {
 }
 
 type Shape struct {
-	ID            string
-	Name          string
-	NameU         string
-	Type          string
-	MasterID      string
-	MasterShapeID string
-	OneD          bool
-	Text          string
-	Cells         map[string]Cell
-	Sections      map[string][]*Section
-	Shapes        []*Shape
+	ID               string
+	Name             string
+	NameU            string
+	Type             string
+	MasterID         string
+	MasterShapeID    string
+	resolvedMasterID string
+	OneD             bool
+	Text             string
+	Cells            map[string]Cell
+	Sections         map[string][]*Section
+	Shapes           []*Shape
 }
 
 type Section struct {
@@ -76,6 +78,7 @@ type Row struct {
 type Cell struct {
 	Name    string
 	Value   string
+	Unit    string
 	Formula string
 }
 
@@ -122,6 +125,7 @@ func Parse(data []byte) (*Document, error) {
 		masters:  map[string]*Master{},
 		pageByID: map[string]*Page{},
 	}
+	document.DefaultFont = parseDefaultFont(files, documentPart)
 
 	if mastersPart, ok := relationshipTarget(documentPart, documentRels, relTypeMasters); ok {
 		masters, err := parseMasters(files, mastersPart)
@@ -174,6 +178,13 @@ func (s *Shape) Cell(name string) (Cell, bool) {
 	return cell, ok
 }
 
+func (s *Shape) ResolvedMasterID() string {
+	if s.resolvedMasterID != "" {
+		return s.resolvedMasterID
+	}
+	return s.MasterID
+}
+
 func (s *Shape) SectionsNamed(name string) []*Section {
 	return s.Sections[name]
 }
@@ -217,8 +228,8 @@ func parsePages(files map[string]*zip.File, pagesPart string) ([]*Page, error) {
 			NameU:        entry.NameU,
 			BackgroundID: entry.BackPage,
 			IsBackground: entry.Background == "1",
-			Width:        readLength(contents.PageSheet.Cells, "PageWidth", 8.5),
-			Height:       readLength(contents.PageSheet.Cells, "PageHeight", 11),
+			Width:        readLength(entry.PageSheet.Cells, "PageWidth", readLength(contents.PageSheet.Cells, "PageWidth", 8.5)),
+			Height:       readLength(entry.PageSheet.Cells, "PageHeight", readLength(contents.PageSheet.Cells, "PageHeight", 11)),
 			Shapes:       parseShapes(contents.Shapes.Shapes),
 		}
 		pages = append(pages, page)
@@ -250,7 +261,7 @@ func parseMasters(files map[string]*zip.File, mastersPart string) (map[string]*M
 			return nil, fmt.Errorf("read master %s: %w", entry.ID, err)
 		}
 
-		parsedShapes := parseShapes(contents.Shapes.Shapes)
+		parsedShapes := parseMasterShapes(contents.Shapes.Shapes)
 		master := &Master{
 			ID:        entry.ID,
 			Name:      entry.Name,
@@ -293,20 +304,33 @@ func indexShapes(index map[string]*Shape, shape *Shape) {
 }
 
 func parseShapes(raw []shapeXML) []*Shape {
+	return parseShapesWithInheritedMaster(raw, "")
+}
+
+func parseMasterShapes(raw []shapeXML) []*Shape {
+	return parseShapesWithInheritedMaster(raw, "")
+}
+
+func parseShapesWithInheritedMaster(raw []shapeXML, inheritedMasterID string) []*Shape {
 	shapes := make([]*Shape, 0, len(raw))
 	for _, item := range raw {
+		effectiveMasterID := inheritedMasterID
+		if item.Master != "" {
+			effectiveMasterID = item.Master
+		}
 		shape := &Shape{
-			ID:            item.ID,
-			Name:          item.Name,
-			NameU:         item.NameU,
-			Type:          item.Type,
-			MasterID:      item.Master,
-			MasterShapeID: item.MasterShape,
-			OneD:          item.OneD == "1" || strings.EqualFold(item.OneD, "true"),
-			Text:          flattenText(item.Text.Raw),
-			Cells:         makeCellMap(item.Cells),
-			Sections:      makeSectionMap(item.Sections),
-			Shapes:        parseShapes(item.Shapes.Shapes),
+			ID:               item.ID,
+			Name:             item.Name,
+			NameU:            item.NameU,
+			Type:             item.Type,
+			MasterID:         item.Master,
+			MasterShapeID:    item.MasterShape,
+			resolvedMasterID: effectiveMasterID,
+			OneD:             item.OneD == "1" || strings.EqualFold(item.OneD, "true"),
+			Text:             flattenText(item.Text.Raw),
+			Cells:            makeCellMap(item.Cells),
+			Sections:         makeSectionMap(item.Sections),
+			Shapes:           parseShapesWithInheritedMaster(item.Shapes.Shapes, effectiveMasterID),
 		}
 		shapes = append(shapes, shape)
 	}
@@ -319,6 +343,7 @@ func makeCellMap(raw []cellXML) map[string]Cell {
 		cells[cell.Name] = Cell{
 			Name:    cell.Name,
 			Value:   cell.Value,
+			Unit:    cell.Unit,
 			Formula: cell.Formula,
 		}
 	}
@@ -614,6 +639,22 @@ func normalizeUnit(unit string) string {
 	return strings.Trim(strings.ToLower(strings.TrimSpace(unit)), ".")
 }
 
+func parseDefaultFont(files map[string]*zip.File, documentPart string) string {
+	var doc visioDocumentXML
+	if err := readXMLFile(files, documentPart, &doc); err != nil {
+		return ""
+	}
+	for _, face := range doc.FaceNames {
+		if name := strings.TrimSpace(face.NameU); name != "" {
+			return name
+		}
+		if name := strings.TrimSpace(face.Name); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
 type relationshipsXML struct {
 	Relationships []relationshipXML `xml:"Relationship"`
 }
@@ -634,6 +675,7 @@ type pageEntryXML struct {
 	NameU      string          `xml:"NameU,attr"`
 	Background string          `xml:"Background,attr"`
 	BackPage   string          `xml:"BackPage,attr"`
+	PageSheet  sheetXML        `xml:"PageSheet"`
 	Rel        relationshipRef `xml:"Rel"`
 }
 
@@ -700,5 +742,15 @@ type rowXML struct {
 type cellXML struct {
 	Name    string `xml:"N,attr"`
 	Value   string `xml:"V,attr"`
+	Unit    string `xml:"U,attr"`
 	Formula string `xml:"F,attr"`
+}
+
+type visioDocumentXML struct {
+	FaceNames []faceNameXML `xml:"FaceNames>FaceName"`
+}
+
+type faceNameXML struct {
+	Name  string `xml:"Name,attr"`
+	NameU string `xml:"NameU,attr"`
 }

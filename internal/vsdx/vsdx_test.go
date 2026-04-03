@@ -26,6 +26,9 @@ func TestParseAndRenderSimplePackage(t *testing.T) {
 	if page.Name != "Page-1" {
 		t.Fatalf("page name = %q", page.Name)
 	}
+	if page.Width != 20 || page.Height != 30 {
+		t.Fatalf("page size = %vx%v, want 20x30", page.Width, page.Height)
+	}
 	if len(page.Shapes) != 1 {
 		t.Fatalf("expected 1 shape, got %d", len(page.Shapes))
 	}
@@ -75,6 +78,10 @@ func buildFixturePackage(t *testing.T) []byte {
 		"visio/pages/pages.xml": `<?xml version="1.0" encoding="UTF-8"?>
 <Pages xmlns="http://schemas.microsoft.com/office/visio/2012/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <Page ID="1" Name="Page-1" NameU="Page-1">
+    <PageSheet>
+      <Cell N="PageWidth" V="20" U="IN"/>
+      <Cell N="PageHeight" V="30" U="IN"/>
+    </PageSheet>
     <Rel r:id="rId1"/>
   </Page>
 </Pages>`,
@@ -84,10 +91,6 @@ func buildFixturePackage(t *testing.T) []byte {
 </Relationships>`,
 		"visio/pages/page1.xml": `<?xml version="1.0" encoding="UTF-8"?>
 <PageContents xmlns="http://schemas.microsoft.com/office/visio/2012/main">
-  <PageSheet>
-    <Cell N="PageWidth" V="8.5"/>
-    <Cell N="PageHeight" V="11"/>
-  </PageSheet>
   <Shapes>
     <Shape ID="1" Name="Rect" NameU="Rectangle">
       <Cell N="PinX" V="4.25"/>
@@ -104,7 +107,7 @@ func buildFixturePackage(t *testing.T) []byte {
       <Text>Hello world</Text>
       <Section N="Character">
         <Row IX="0">
-          <Cell N="Size" V="12 pt"/>
+          <Cell N="Size" V="12" U="PT"/>
           <Cell N="Color" V="#102030"/>
         </Row>
       </Section>

@@ -50,46 +50,71 @@ type geometryRender struct {
 
 type context struct {
 	document *vsdx.Document
+	fonts    *fontLibrary
 }
 
 func Convert(document *vsdx.Document) ([]byte, error) {
-	ctx := &context{document: document}
+	ctx := &context{
+		document: document,
+		fonts:    newFontLibrary(document.DefaultFont),
+	}
 	result := &pdf.Document{}
+	maxWidth := 0.0
+	maxHeight := 0.0
 
 	for _, page := range document.Pages {
 		if page.IsBackground {
 			continue
 		}
-		content, err := ctx.renderPage(page)
+		if page.Width > maxWidth {
+			maxWidth = page.Width
+		}
+		if page.Height > maxHeight {
+			maxHeight = page.Height
+		}
+	}
+	if maxWidth <= 0 {
+		maxWidth = 8.5
+	}
+	if maxHeight <= 0 {
+		maxHeight = 11
+	}
+
+	for _, page := range document.Pages {
+		if page.IsBackground {
+			continue
+		}
+		content, err := ctx.renderPage(page, maxHeight-page.Height)
 		if err != nil {
 			return nil, fmt.Errorf("render page %s: %w", page.NameOrFallback(), err)
 		}
-		width := page.Width * 72
-		height := page.Height * 72
-		if width <= 0 {
-			width = 612
-		}
-		if height <= 0 {
-			height = 792
-		}
+		width := maxWidth * 72
+		height := maxHeight * 72
 		result.AddPage(width, height, content)
 	}
 
 	if len(result.Pages) == 0 {
 		result.AddPage(612, 792, []byte{})
 	}
+	result.Fonts = ctx.fonts.Specs()
 
 	return result.Bytes()
 }
 
-func (ctx *context) renderPage(page *vsdx.Page) ([]byte, error) {
+func (ctx *context) renderPage(page *vsdx.Page, offsetY float64) ([]byte, error) {
 	var buffer bytes.Buffer
 	buffer.WriteString("1 J\n1 j\n")
+	if offsetY != 0 {
+		fmt.Fprintf(&buffer, "q\n1 0 0 1 0 %s cm\n", pdf.FormatNumber(offsetY*72))
+	}
 
 	visited := map[string]bool{}
 	ctx.renderBackground(&buffer, page, visited)
 	for _, shape := range page.Shapes {
 		ctx.renderShape(&buffer, shape, identityMatrix())
+	}
+	if offsetY != 0 {
+		buffer.WriteString("Q\n")
 	}
 
 	return buffer.Bytes(), nil
@@ -255,16 +280,20 @@ func (ctx *context) writeText(buffer *bytes.Buffer, shape *vsdx.Shape, shapeXfor
 	}
 
 	fontSize := ctx.fontSize(shape)
+	fontSpec := ctx.textFont(shape)
 	textColor := ctx.textColor(shape)
 	availableWidth := math.Max(textWidth-leftMargin-rightMargin, 0.1)
-	lines := wrapText(text, availableWidth*72, fontSize)
+	availableHeightPoints := math.Max((textHeight-topMargin-bottomMargin)*72, 0.1)
+	lines, fontSize := fitTextToBox(text, availableWidth*72, availableHeightPoints, fontSize, func(value string, size float64) float64 {
+		return measureTextWidth(value, fontSpec, size)
+	})
 	if len(lines) == 0 {
 		return
 	}
 
-	lineHeight := fontSize * 1.2
+	lineHeight := textLineHeight(fontSize)
 	contentHeight := float64(len(lines)) * lineHeight
-	innerHeight := math.Max((textHeight-topMargin-bottomMargin)*72, lineHeight)
+	innerHeight := math.Max(availableHeightPoints, lineHeight)
 	topGap := 0.0
 	switch ctx.verticalAlign(shape) {
 	case 0:
@@ -284,7 +313,7 @@ func (ctx *context) writeText(buffer *bytes.Buffer, shape *vsdx.Shape, shapeXfor
 	sinAngle := math.Sin(angle)
 
 	for index, line := range lines {
-		lineWidth := estimateTextWidth(line, fontSize)
+		lineWidth := measureTextWidth(line, fontSpec, fontSize)
 		xPoints := leftMargin * 72
 		switch ctx.horizontalAlign(shape) {
 		case 1:
@@ -303,7 +332,7 @@ func (ctx *context) writeText(buffer *bytes.Buffer, shape *vsdx.Shape, shapeXfor
 
 		position := applyInPoints(world, point{X: xPoints / 72, Y: yPoints / 72})
 		buffer.WriteString("BT\n")
-		fmt.Fprintf(buffer, "/F1 %s Tf\n", pdf.FormatNumber(fontSize))
+		fmt.Fprintf(buffer, "/%s %s Tf\n", fontSpec.Resource, pdf.FormatNumber(fontSize))
 		fmt.Fprintf(buffer, "%s %s %s %s %s %s Tm\n",
 			pdf.FormatNumber(cosAngle),
 			pdf.FormatNumber(sinAngle),
@@ -312,7 +341,7 @@ func (ctx *context) writeText(buffer *bytes.Buffer, shape *vsdx.Shape, shapeXfor
 			pdf.FormatNumber(position.X),
 			pdf.FormatNumber(position.Y),
 		)
-		fmt.Fprintf(buffer, "(%s) Tj\n", pdf.EscapeText(line))
+		fmt.Fprintf(buffer, "(%s) Tj\n", pdf.EscapeLiteralBytes(pdf.EncodeWinAnsi(line)))
 		buffer.WriteString("ET\n")
 	}
 
@@ -387,13 +416,44 @@ func (ctx *context) textMatrix(shape *vsdx.Shape, width, height float64) matrix 
 }
 
 func (ctx *context) children(shape *vsdx.Shape) []*vsdx.Shape {
-	if len(shape.Shapes) > 0 {
-		return shape.Shapes
+	base := ctx.baseShape(shape)
+	if base == nil || len(base.Shapes) == 0 {
+		if len(shape.Shapes) > 0 {
+			return shape.Shapes
+		}
+		return nil
 	}
-	if base := ctx.baseShape(shape); base != nil {
-		return ctx.children(base)
+	if len(shape.Shapes) == 0 {
+		return base.Shapes
 	}
-	return nil
+
+	overrides := make(map[string]*vsdx.Shape, len(shape.Shapes))
+	used := make(map[*vsdx.Shape]bool, len(shape.Shapes))
+	merged := make([]*vsdx.Shape, 0, len(base.Shapes)+len(shape.Shapes))
+
+	for _, child := range shape.Shapes {
+		if child.MasterShapeID != "" {
+			overrides[child.MasterShapeID] = child
+		}
+	}
+
+	for _, baseChild := range base.Shapes {
+		if override, ok := overrides[baseChild.ID]; ok {
+			merged = append(merged, override)
+			used[override] = true
+			continue
+		}
+		merged = append(merged, baseChild)
+	}
+
+	for _, child := range shape.Shapes {
+		if used[child] {
+			continue
+		}
+		merged = append(merged, child)
+	}
+
+	return merged
 }
 
 func (ctx *context) text(shape *vsdx.Shape) string {
@@ -407,37 +467,52 @@ func (ctx *context) text(shape *vsdx.Shape) string {
 }
 
 func (ctx *context) geometrySections(shape *vsdx.Shape) []*vsdx.Section {
-	if sections := shape.SectionsNamed("Geometry"); len(sections) > 0 {
-		return sections
+	sections := shape.SectionsNamed("Geometry")
+	base := ctx.baseShape(shape)
+	if base == nil {
+		return ctx.resolveGeometrySectionBooleans(shape, cloneSections(sections))
 	}
-	if base := ctx.baseShape(shape); base != nil {
-		return ctx.geometrySections(base)
+	baseSections := ctx.geometrySections(base)
+	if len(sections) == 0 {
+		return baseSections
 	}
-	return nil
+	if len(baseSections) == 0 {
+		return ctx.resolveGeometrySectionBooleans(shape, cloneSections(sections))
+	}
+	return ctx.resolveGeometrySectionBooleans(shape, mergeSections(baseSections, sections))
 }
 
 func (ctx *context) baseShape(shape *vsdx.Shape) *vsdx.Shape {
-	if shape.MasterID == "" {
+	masterID := shape.ResolvedMasterID()
+	if masterID == "" {
 		return nil
 	}
-	master := ctx.document.Master(shape.MasterID)
+	master := ctx.document.Master(masterID)
 	if master == nil {
 		return nil
 	}
-	if base := master.Shape(shape.MasterShapeID); base != nil {
-		return base
+	if shape.MasterShapeID != "" {
+		return master.Shape(shape.MasterShapeID)
 	}
 	return master.RootShape
 }
 
 func (ctx *context) cell(shape *vsdx.Shape, name string) (string, bool) {
-	if cell, ok := shape.Cell(name); ok && strings.TrimSpace(cell.Value) != "" {
-		return cell.Value, true
+	cell, ok := ctx.cellData(shape, name)
+	if !ok {
+		return "", false
+	}
+	return cell.Value, true
+}
+
+func (ctx *context) cellData(shape *vsdx.Shape, name string) (vsdx.Cell, bool) {
+	if cell, ok := shape.Cell(name); ok && (strings.TrimSpace(cell.Value) != "" || strings.TrimSpace(cell.Formula) != "") {
+		return cell, true
 	}
 	if base := ctx.baseShape(shape); base != nil {
-		return ctx.cell(base, name)
+		return ctx.cellData(base, name)
 	}
-	return "", false
+	return vsdx.Cell{}, false
 }
 
 func (ctx *context) sectionCell(shape *vsdx.Shape, sectionName, cellName string) (string, bool) {
@@ -453,23 +528,34 @@ func (ctx *context) sectionCell(shape *vsdx.Shape, sectionName, cellName string)
 }
 
 func (ctx *context) rowCell(shape *vsdx.Shape, sectionName, cellName string) (string, bool) {
+	cell, ok := ctx.rowCellData(shape, sectionName, cellName)
+	if !ok {
+		return "", false
+	}
+	return cell.Value, true
+}
+
+func (ctx *context) rowCellData(shape *vsdx.Shape, sectionName, cellName string) (vsdx.Cell, bool) {
 	if sections := shape.SectionsNamed(sectionName); len(sections) > 0 && len(sections[0].Rows) > 0 {
-		if cell, ok := sections[0].Rows[0].Cell(cellName); ok && strings.TrimSpace(cell.Value) != "" {
-			return cell.Value, true
+		if cell, ok := sections[0].Rows[0].Cell(cellName); ok && (strings.TrimSpace(cell.Value) != "" || strings.TrimSpace(cell.Formula) != "") {
+			return cell, true
 		}
 	}
 	if base := ctx.baseShape(shape); base != nil {
-		return ctx.rowCell(base, sectionName, cellName)
+		return ctx.rowCellData(base, sectionName, cellName)
 	}
-	return "", false
+	return vsdx.Cell{}, false
 }
 
 func (ctx *context) boolCell(shape *vsdx.Shape, name string) (bool, bool) {
-	value, ok := ctx.cell(shape, name)
+	cell, ok := ctx.cellData(shape, name)
 	if !ok {
 		return false, false
 	}
-	return vsdx.ParseBool(value)
+	if value, ok := ctx.evalBoolFormula(shape, cell.Formula); ok {
+		return value, true
+	}
+	return vsdx.ParseBool(cell.Value)
 }
 
 func (ctx *context) lengthCell(shape *vsdx.Shape, name string, fallback float64) float64 {
@@ -553,6 +639,11 @@ func (ctx *context) fillStyle(shape *vsdx.Shape) (color, bool) {
 	if value, ok := ctx.cell(shape, "FillForegndTrans"); ok && transparencyValue(value) >= 1 {
 		return color{}, false
 	}
+	if cell, ok := ctx.cellData(shape, "FillForegnd"); ok {
+		if fill, ok := parseColorCell(cell.Value, cell.Formula); ok {
+			return fill, true
+		}
+	}
 	if fill, ok := parseColorValue(ctx.cellValue(shape, "FillForegnd")); ok {
 		return fill, true
 	}
@@ -569,6 +660,16 @@ func (ctx *context) strokeStyle(shape *vsdx.Shape) (color, bool) {
 	if value, ok := ctx.cell(shape, "LineColorTrans"); ok && transparencyValue(value) >= 1 {
 		return color{}, false
 	}
+	if cell, ok := ctx.cellData(shape, "LineColor"); ok {
+		if stroke, ok := parseColorCell(cell.Value, cell.Formula); ok {
+			return stroke, true
+		}
+		if strings.EqualFold(strings.TrimSpace(cell.Value), "Themed") {
+			if fill, ok := ctx.fillStyle(shape); ok {
+				return darkenColor(fill, 0.75), true
+			}
+		}
+	}
 	if stroke, ok := parseColorValue(ctx.cellValue(shape, "LineColor")); ok {
 		return stroke, true
 	}
@@ -576,10 +677,18 @@ func (ctx *context) strokeStyle(shape *vsdx.Shape) (color, bool) {
 }
 
 func (ctx *context) textColor(shape *vsdx.Shape) color {
-	if value, ok := ctx.rowCell(shape, "Character", "Color"); ok {
-		if parsed, ok := parseColorValue(value); ok {
+	if cell, ok := ctx.rowCellData(shape, "Character", "Color"); ok {
+		if parsed, ok := parseColorCell(cell.Value, cell.Formula); ok {
+			if strings.EqualFold(strings.TrimSpace(cell.Value), "Themed") {
+				if fill, ok := ctx.fillStyle(shape); ok && colorLuminance(fill) < 0.45 {
+					return color{R: 1, G: 1, B: 1}
+				}
+			}
 			return parsed
 		}
+	}
+	if fill, ok := ctx.fillStyle(shape); ok && colorLuminance(fill) < 0.45 {
+		return color{R: 1, G: 1, B: 1}
 	}
 	return color{R: 0, G: 0, B: 0}
 }
@@ -591,6 +700,46 @@ func (ctx *context) fontSize(shape *vsdx.Shape) float64 {
 		}
 	}
 	return 12
+}
+
+func (ctx *context) textFont(shape *vsdx.Shape) *pdf.FontSpec {
+	bold, italic := ctx.fontStyle(shape)
+	return ctx.fonts.Resolve(ctx.fontFamily(shape), bold, italic)
+}
+
+func (ctx *context) fontFamily(shape *vsdx.Shape) string {
+	if value, ok := ctx.rowCell(shape, "Character", "Font"); ok {
+		trimmed := strings.TrimSpace(strings.Trim(value, "\""))
+		switch {
+		case trimmed == "":
+		case strings.EqualFold(trimmed, "Themed"):
+		default:
+			if _, ok := vsdx.ParseNumber(trimmed); !ok {
+				return trimmed
+			}
+		}
+	}
+	if strings.TrimSpace(ctx.document.DefaultFont) != "" {
+		return ctx.document.DefaultFont
+	}
+	return "Calibri"
+}
+
+func (ctx *context) fontStyle(shape *vsdx.Shape) (bold bool, italic bool) {
+	value, ok := ctx.rowCell(shape, "Character", "Style")
+	if !ok {
+		return false, false
+	}
+	trimmed := strings.TrimSpace(strings.Trim(value, "\""))
+	if trimmed == "" || strings.EqualFold(trimmed, "Themed") {
+		return false, false
+	}
+	parsed, ok := vsdx.ParseNumber(trimmed)
+	if !ok {
+		return false, false
+	}
+	flags := int(math.Round(parsed))
+	return flags&1 != 0, flags&2 != 0
 }
 
 func (ctx *context) horizontalAlign(shape *vsdx.Shape) int {
@@ -622,7 +771,7 @@ func (ctx *context) cellValue(shape *vsdx.Shape, name string) string {
 }
 
 func (ctx *context) fallbackPath(shape *vsdx.Shape, width, height float64) (vectorPath, bool) {
-	if len(ctx.children(shape)) > 0 || width <= 0 || height <= 0 {
+	if len(ctx.children(shape)) > 0 || width <= 0 || height <= 0 || shape.OneD {
 		return vectorPath{}, false
 	}
 
@@ -1078,6 +1227,35 @@ func parseColorValue(value string) (color, bool) {
 	return color{}, false
 }
 
+func parseColorCell(value, formula string) (color, bool) {
+	if parsed, ok := parseColorValue(value); ok {
+		return parsed, true
+	}
+
+	formula = strings.TrimSpace(formula)
+	if formula == "" {
+		return color{}, false
+	}
+
+	if index := strings.Index(formula, "#"); index >= 0 && index+7 <= len(formula) {
+		if parsed, ok := parseColorValue(formula[index : index+7]); ok {
+			return parsed, true
+		}
+	}
+
+	upper := strings.ToUpper(formula)
+	if start := strings.Index(upper, "RGB("); start >= 0 {
+		end := strings.Index(upper[start:], ")")
+		if end > 0 {
+			if parsed, ok := parseColorValue(formula[start : start+end+1]); ok {
+				return parsed, true
+			}
+		}
+	}
+
+	return color{}, false
+}
+
 func parseFontSize(value string) (float64, bool) {
 	number, unit := splitValue(value)
 	if number == "" {
@@ -1137,7 +1315,25 @@ func parseHexPair(value string) (int64, error) {
 	return strconv.ParseInt(value, 16, 64)
 }
 
-func wrapText(text string, maxWidth, fontSize float64) []string {
+func colorLuminance(value color) float64 {
+	return value.R*0.299 + value.G*0.587 + value.B*0.114
+}
+
+func darkenColor(value color, factor float64) color {
+	if factor < 0 {
+		factor = 0
+	}
+	if factor > 1 {
+		factor = 1
+	}
+	return color{
+		R: value.R * factor,
+		G: value.G * factor,
+		B: value.B * factor,
+	}
+}
+
+func wrapText(text string, maxWidth, fontSize float64, measure func(string, float64) float64) []string {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
@@ -1153,12 +1349,12 @@ func wrapText(text string, maxWidth, fontSize float64) []string {
 		current := words[0]
 		for _, word := range words[1:] {
 			candidate := current + " " + word
-			if estimateTextWidth(candidate, fontSize) <= maxWidth {
+			if measure(candidate, fontSize) <= maxWidth {
 				current = candidate
 				continue
 			}
-			if estimateTextWidth(word, fontSize) > maxWidth {
-				lines = append(lines, hardWrap(word, maxWidth, fontSize)...)
+			if measure(word, fontSize) > maxWidth {
+				lines = append(lines, hardWrap(word, maxWidth, fontSize, measure)...)
 				current = ""
 				continue
 			}
@@ -1172,7 +1368,7 @@ func wrapText(text string, maxWidth, fontSize float64) []string {
 	return lines
 }
 
-func hardWrap(word string, maxWidth, fontSize float64) []string {
+func hardWrap(word string, maxWidth, fontSize float64, measure func(string, float64) float64) []string {
 	if word == "" {
 		return nil
 	}
@@ -1180,7 +1376,7 @@ func hardWrap(word string, maxWidth, fontSize float64) []string {
 	var builder strings.Builder
 	for _, r := range word {
 		next := builder.String() + string(r)
-		if builder.Len() > 0 && estimateTextWidth(next, fontSize) > maxWidth {
+		if builder.Len() > 0 && measure(next, fontSize) > maxWidth {
 			lines = append(lines, builder.String())
 			builder.Reset()
 		}
@@ -1190,6 +1386,45 @@ func hardWrap(word string, maxWidth, fontSize float64) []string {
 		lines = append(lines, builder.String())
 	}
 	return lines
+}
+
+func fitTextToBox(text string, maxWidth, maxHeight, initialFontSize float64, measure func(string, float64) float64) ([]string, float64) {
+	if initialFontSize <= 0 {
+		initialFontSize = 12
+	}
+
+	fontSize := initialFontSize
+	minFontSize := math.Min(initialFontSize, 4)
+	if minFontSize <= 0 {
+		minFontSize = 4
+	}
+	if maxHeight <= 0 {
+		return wrapText(text, maxWidth, fontSize, measure), fontSize
+	}
+
+	for {
+		lines := wrapText(text, maxWidth, fontSize, measure)
+		if len(lines) == 0 {
+			return nil, fontSize
+		}
+		if float64(len(lines))*textLineHeight(fontSize) <= maxHeight+0.01 {
+			return lines, fontSize
+		}
+		if fontSize <= minFontSize {
+			return lines, fontSize
+		}
+		fontSize -= 0.5
+		if fontSize < minFontSize {
+			fontSize = minFontSize
+		}
+	}
+}
+
+func textLineHeight(fontSize float64) float64 {
+	if fontSize <= 8 {
+		return fontSize * 1.05
+	}
+	return fontSize * 1.15
 }
 
 func estimateTextWidth(text string, fontSize float64) float64 {
@@ -1209,6 +1444,568 @@ func estimateTextWidth(text string, fontSize float64) float64 {
 		}
 	}
 	return total
+}
+
+func measureTextWidth(text string, font *pdf.FontSpec, fontSize float64) float64 {
+	if font != nil && font.TrueType != nil {
+		return font.TrueType.MeasureText(text, fontSize)
+	}
+	return estimateTextWidth(text, fontSize)
+}
+
+func (ctx *context) resolveGeometrySectionBooleans(shape *vsdx.Shape, sections []*vsdx.Section) []*vsdx.Section {
+	for _, section := range sections {
+		if section == nil {
+			continue
+		}
+		for _, name := range []string{"NoShow", "NoFill", "NoLine"} {
+			cell, ok := section.Cells[name]
+			if !ok {
+				continue
+			}
+			if value, ok := ctx.evalBoolFormula(shape, cell.Formula); ok {
+				if value {
+					cell.Value = "1"
+				} else {
+					cell.Value = "0"
+				}
+				section.Cells[name] = cell
+			}
+		}
+	}
+	return sections
+}
+
+func (ctx *context) evalBoolFormula(shape *vsdx.Shape, formula string) (bool, bool) {
+	value, ok := ctx.evalFormula(shape, formula)
+	if !ok {
+		return false, false
+	}
+	return parseFormulaBool(value)
+}
+
+func (ctx *context) evalFormula(shape *vsdx.Shape, formula string) (string, bool) {
+	expr := trimFormula(formula)
+	if expr == "" || strings.EqualFold(expr, "Inh") || strings.EqualFold(expr, "No Formula") {
+		return "", false
+	}
+
+	if value, ok := parseFormulaLiteral(expr); ok {
+		return value, true
+	}
+
+	if name, args, ok := parseFormulaCall(expr); ok {
+		switch strings.ToUpper(name) {
+		case "NOT":
+			if len(args) != 1 {
+				return "", false
+			}
+			value, ok := ctx.evalBoolFormula(shape, args[0])
+			if !ok {
+				return "", false
+			}
+			return boolString(!value), true
+		case "OR":
+			if len(args) == 0 {
+				return "", false
+			}
+			for _, arg := range args {
+				value, ok := ctx.evalBoolFormula(shape, arg)
+				if !ok {
+					return "", false
+				}
+				if value {
+					return "1", true
+				}
+			}
+			return "0", true
+		case "AND":
+			if len(args) == 0 {
+				return "", false
+			}
+			for _, arg := range args {
+				value, ok := ctx.evalBoolFormula(shape, arg)
+				if !ok {
+					return "", false
+				}
+				if !value {
+					return "0", true
+				}
+			}
+			return "1", true
+		case "IF":
+			if len(args) != 3 {
+				return "", false
+			}
+			condition, ok := ctx.evalBoolFormula(shape, args[0])
+			if !ok {
+				return "", false
+			}
+			if condition {
+				return ctx.evalFormula(shape, args[1])
+			}
+			return ctx.evalFormula(shape, args[2])
+		default:
+			return "", false
+		}
+	}
+
+	if index, op, ok := formulaComparison(expr); ok {
+		leftValue, ok := ctx.evalFormula(shape, expr[:index])
+		if !ok {
+			return "", false
+		}
+		rightValue, ok := ctx.evalFormula(shape, expr[index+len(op):])
+		if !ok {
+			return "", false
+		}
+		return boolString(compareFormulaValues(leftValue, rightValue, op)), true
+	}
+
+	if value, ok := ctx.resolveFormulaReference(shape, expr); ok {
+		return value, true
+	}
+
+	return strings.Trim(strings.TrimSpace(expr), `"`), true
+}
+
+func (ctx *context) resolveFormulaReference(shape *vsdx.Shape, expr string) (string, bool) {
+	trimmed := strings.TrimSpace(expr)
+	upper := strings.ToUpper(trimmed)
+	switch {
+	case strings.HasPrefix(upper, "USER."):
+		return ctx.userValue(shape, trimmed[5:])
+	case strings.Contains(upper, "!USER."):
+		parts := strings.SplitN(trimmed, "!", 2)
+		if len(parts) != 2 {
+			return "", false
+		}
+		target := ctx.shapeByFormulaRef(shape, parts[0])
+		if target == nil {
+			return "", false
+		}
+		return ctx.userValue(target, strings.TrimPrefix(parts[1], "User."))
+	default:
+		return "", false
+	}
+}
+
+func (ctx *context) userValue(shape *vsdx.Shape, rowName string) (string, bool) {
+	for _, section := range shape.SectionsNamed("User") {
+		for _, row := range section.Rows {
+			if strings.EqualFold(row.Name, rowName) {
+				if cell, ok := row.Cell("Value"); ok && strings.TrimSpace(cell.Value) != "" {
+					return cell.Value, true
+				}
+			}
+		}
+	}
+	if base := ctx.baseShape(shape); base != nil {
+		return ctx.userValue(base, rowName)
+	}
+	return "", false
+}
+
+func (ctx *context) shapeByFormulaRef(current *vsdx.Shape, ref string) *vsdx.Shape {
+	trimmed := strings.TrimSpace(ref)
+	upper := strings.ToUpper(trimmed)
+	if strings.HasPrefix(upper, "SHEET.") {
+		id := strings.TrimSpace(trimmed[len("Sheet."):])
+		for _, page := range ctx.document.Pages {
+			if found := findShapeByID(page.Shapes, id); found != nil {
+				return found
+			}
+		}
+		for _, masterID := range []string{current.ResolvedMasterID()} {
+			if masterID == "" {
+				continue
+			}
+			if master := ctx.document.Master(masterID); master != nil {
+				if found := master.Shape(id); found != nil {
+					return found
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func findShapeByID(shapes []*vsdx.Shape, id string) *vsdx.Shape {
+	for _, shape := range shapes {
+		if shape == nil {
+			continue
+		}
+		if shape.ID == id {
+			return shape
+		}
+		if found := findShapeByID(shape.Shapes, id); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func parseFormulaLiteral(expr string) (string, bool) {
+	trimmed := strings.Trim(strings.TrimSpace(expr), `"`)
+	switch strings.ToUpper(trimmed) {
+	case "TRUE":
+		return "1", true
+	case "FALSE":
+		return "0", true
+	}
+	if _, ok := vsdx.ParseNumber(trimmed); ok {
+		return trimmed, true
+	}
+	return "", false
+}
+
+func parseFormulaCall(expr string) (string, []string, bool) {
+	expr = trimFormula(expr)
+	open := strings.Index(expr, "(")
+	if open <= 0 || !strings.HasSuffix(expr, ")") {
+		return "", nil, false
+	}
+	name := strings.TrimSpace(expr[:open])
+	body := expr[open+1 : len(expr)-1]
+	if name == "" {
+		return "", nil, false
+	}
+	return name, splitFormulaArgs(body), true
+}
+
+func splitFormulaArgs(expr string) []string {
+	if strings.TrimSpace(expr) == "" {
+		return nil
+	}
+	args := []string{}
+	depth := 0
+	start := 0
+	for index := 0; index < len(expr); index++ {
+		switch expr[index] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				args = append(args, strings.TrimSpace(expr[start:index]))
+				start = index + 1
+			}
+		}
+	}
+	args = append(args, strings.TrimSpace(expr[start:]))
+	return args
+}
+
+func formulaComparison(expr string) (int, string, bool) {
+	depth := 0
+	for index := 0; index < len(expr); index++ {
+		switch expr[index] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '<':
+			if depth == 0 && index+1 < len(expr) && expr[index+1] == '>' {
+				return index, "<>", true
+			}
+		case '=':
+			if depth == 0 {
+				return index, "=", true
+			}
+		}
+	}
+	return 0, "", false
+}
+
+func compareFormulaValues(left, right, op string) bool {
+	if leftNumber, ok := vsdx.ParseNumber(left); ok {
+		if rightNumber, ok := vsdx.ParseNumber(right); ok {
+			switch op {
+			case "=":
+				return math.Abs(leftNumber-rightNumber) < 1e-9
+			case "<>":
+				return math.Abs(leftNumber-rightNumber) >= 1e-9
+			}
+		}
+	}
+	if leftBool, ok := parseFormulaBool(left); ok {
+		if rightBool, ok := parseFormulaBool(right); ok {
+			switch op {
+			case "=":
+				return leftBool == rightBool
+			case "<>":
+				return leftBool != rightBool
+			}
+		}
+	}
+	switch op {
+	case "=":
+		return strings.EqualFold(strings.Trim(left, `"`), strings.Trim(right, `"`))
+	case "<>":
+		return !strings.EqualFold(strings.Trim(left, `"`), strings.Trim(right, `"`))
+	default:
+		return false
+	}
+}
+
+func parseFormulaBool(value string) (bool, bool) {
+	if parsed, ok := vsdx.ParseBool(value); ok {
+		return parsed, true
+	}
+	if number, ok := vsdx.ParseNumber(value); ok {
+		return math.Abs(number) > 1e-9, true
+	}
+	return false, false
+}
+
+func boolString(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}
+
+func trimFormula(expr string) string {
+	expr = strings.TrimSpace(expr)
+	for strings.HasPrefix(expr, "(") && strings.HasSuffix(expr, ")") {
+		depth := 0
+		whole := true
+		for index := 0; index < len(expr); index++ {
+			switch expr[index] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 && index != len(expr)-1 {
+					whole = false
+				}
+			}
+		}
+		if !whole {
+			break
+		}
+		expr = strings.TrimSpace(expr[1 : len(expr)-1])
+	}
+	return expr
+}
+
+func cloneSections(sections []*vsdx.Section) []*vsdx.Section {
+	if len(sections) == 0 {
+		return nil
+	}
+	cloned := make([]*vsdx.Section, 0, len(sections))
+	for _, section := range sections {
+		cloned = append(cloned, cloneSection(section))
+	}
+	return cloned
+}
+
+func cloneSection(section *vsdx.Section) *vsdx.Section {
+	if section == nil {
+		return nil
+	}
+	cloned := &vsdx.Section{
+		Name:  section.Name,
+		Index: section.Index,
+		Cells: cloneCellMap(section.Cells),
+		Rows:  make([]*vsdx.Row, 0, len(section.Rows)),
+	}
+	for _, row := range section.Rows {
+		cloned.Rows = append(cloned.Rows, cloneRow(row))
+	}
+	return cloned
+}
+
+func cloneRow(row *vsdx.Row) *vsdx.Row {
+	if row == nil {
+		return nil
+	}
+	return &vsdx.Row{
+		Name:  row.Name,
+		Type:  row.Type,
+		Index: row.Index,
+		Cells: cloneCellMap(row.Cells),
+	}
+}
+
+func cloneCellMap(source map[string]vsdx.Cell) map[string]vsdx.Cell {
+	if len(source) == 0 {
+		return map[string]vsdx.Cell{}
+	}
+	cloned := make(map[string]vsdx.Cell, len(source))
+	for key, cell := range source {
+		cloned[key] = cell
+	}
+	return cloned
+}
+
+func mergeSections(base, override []*vsdx.Section) []*vsdx.Section {
+	merged := make([]*vsdx.Section, 0, maxInt(len(base), len(override)))
+	used := make([]bool, len(override))
+
+	for index, baseSection := range base {
+		overrideIndex := matchingSection(baseSection, override, used, index)
+		if overrideIndex == -1 {
+			merged = append(merged, cloneSection(baseSection))
+			continue
+		}
+		used[overrideIndex] = true
+		merged = append(merged, mergeSection(baseSection, override[overrideIndex]))
+	}
+
+	for index, section := range override {
+		if used[index] {
+			continue
+		}
+		merged = append(merged, cloneSection(section))
+	}
+
+	return merged
+}
+
+func matchingSection(baseSection *vsdx.Section, override []*vsdx.Section, used []bool, fallbackIndex int) int {
+	if baseSection != nil && baseSection.Index != "" {
+		for index, section := range override {
+			if used[index] || section == nil {
+				continue
+			}
+			if section.Index == baseSection.Index {
+				return index
+			}
+		}
+		return -1
+	}
+	if anySectionHasIndex(override) {
+		return -1
+	}
+	if fallbackIndex < len(override) && !used[fallbackIndex] {
+		return fallbackIndex
+	}
+	return -1
+}
+
+func mergeSection(baseSection, overrideSection *vsdx.Section) *vsdx.Section {
+	if baseSection == nil {
+		return cloneSection(overrideSection)
+	}
+	if overrideSection == nil {
+		return cloneSection(baseSection)
+	}
+
+	merged := &vsdx.Section{
+		Name:  firstNonEmpty(overrideSection.Name, baseSection.Name),
+		Index: firstNonEmpty(overrideSection.Index, baseSection.Index),
+		Cells: cloneCellMap(baseSection.Cells),
+		Rows:  mergeRows(baseSection.Rows, overrideSection.Rows),
+	}
+	for key, cell := range overrideSection.Cells {
+		merged.Cells[key] = cell
+	}
+	return merged
+}
+
+func mergeRows(baseRows, overrideRows []*vsdx.Row) []*vsdx.Row {
+	merged := make([]*vsdx.Row, 0, maxInt(len(baseRows), len(overrideRows)))
+	used := make([]bool, len(overrideRows))
+
+	for index, baseRow := range baseRows {
+		overrideIndex := matchingRow(baseRow, overrideRows, used, index)
+		if overrideIndex == -1 {
+			merged = append(merged, cloneRow(baseRow))
+			continue
+		}
+		used[overrideIndex] = true
+		merged = append(merged, mergeRow(baseRow, overrideRows[overrideIndex]))
+	}
+
+	for index, row := range overrideRows {
+		if used[index] {
+			continue
+		}
+		merged = append(merged, cloneRow(row))
+	}
+
+	return merged
+}
+
+func matchingRow(baseRow *vsdx.Row, overrideRows []*vsdx.Row, used []bool, fallbackIndex int) int {
+	if baseRow != nil && baseRow.Index != "" {
+		for index, row := range overrideRows {
+			if used[index] || row == nil {
+				continue
+			}
+			if row.Index == baseRow.Index {
+				return index
+			}
+		}
+		return -1
+	}
+	if anyRowHasIndex(overrideRows) {
+		return -1
+	}
+	if fallbackIndex < len(overrideRows) && !used[fallbackIndex] {
+		return fallbackIndex
+	}
+	return -1
+}
+
+func mergeRow(baseRow, overrideRow *vsdx.Row) *vsdx.Row {
+	if baseRow == nil {
+		return cloneRow(overrideRow)
+	}
+	if overrideRow == nil {
+		return cloneRow(baseRow)
+	}
+
+	merged := &vsdx.Row{
+		Name:  firstNonEmpty(overrideRow.Name, baseRow.Name),
+		Type:  firstNonEmpty(overrideRow.Type, baseRow.Type),
+		Index: firstNonEmpty(overrideRow.Index, baseRow.Index),
+		Cells: cloneCellMap(baseRow.Cells),
+	}
+	for key, cell := range overrideRow.Cells {
+		merged.Cells[key] = cell
+	}
+	return merged
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func anySectionHasIndex(sections []*vsdx.Section) bool {
+	for _, section := range sections {
+		if section != nil && strings.TrimSpace(section.Index) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func anyRowHasIndex(rows []*vsdx.Row) bool {
+	for _, row := range rows {
+		if row != nil && strings.TrimSpace(row.Index) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func identityMatrix() matrix {
